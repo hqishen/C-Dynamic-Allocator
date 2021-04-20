@@ -1,7 +1,25 @@
 #include <string.h>
 #include <stdio.h>
-#include <math.h>
 #include <unistd.h>
+
+/* When requesting memory from the OS using sbrk(), request it in
+* increments of CHUNK_SIZE. */
+#define CHUNK_SIZE (1<<12)
+
+typedef struct MemNode {
+	size_t header;
+	char data[0];
+    struct MemNode *next;
+    struct MemNode *prev;
+} MemNode;
+
+typedef struct MemList {
+	MemNode *chunkList[8];
+} MemList;
+
+int printFlag = 0;
+#define my_print(fmt, args...) if (printFlag) fprintf(stderr, "File Name:%s, Func Name:%s, Line:%d " fmt,__FILE__, __FUNCTION__, __LINE__, ##args);
+static MemList *gMemDataTable = NULL;
 
 /* The standard allocator interface from stdlib.h.  These are the
  * functions you must implement, more information on each function is
@@ -11,34 +29,51 @@ void *malloc(size_t size);
 void free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
+void set_chunk_alloc_flag(MemNode *node);
+void set_chunk_free_flag(MemNode *node);
+int get_chunk_free_flag(MemNode *node);
+int get_chunk_size(MemNode *node);
+double _pow(double b, int e);
+size_t alignment(size_t size);
 
-/* When requesting memory from the OS using sbrk(), request it in
- * increments of CHUNK_SIZE. */
-#define __CHUNK_SIZE (1<<12)
-#define __CHUNK_NUM 8
-#define __OFFICE_SIZE 32
+void set_chunk_alloc_flag(MemNode *node)
+{
+	node->header = node->header |0x00000001;
+}
 
-#define __ALLOC(block)	block->flag = 1
-#define __FREE(block) block->flag = 0
-#define __CHECK_FREE(block)	!(block->flag & 1)
-
-typedef struct DataNode {
-    unsigned char flag;
-    unsigned int header;
-
-    char data[0];
-
-    struct DataNode *next;
-
-    struct DataNode *prev;
-} DataNode;
-
-typedef struct {
-    DataNode *chunckList[__CHUNK_NUM];
-} MemList;
+void set_chunk_free_flag(MemNode *node)
+{
+	node->header &= ~0x00000001;
+}
 
 
-static MemList *memTable = NULL;
+int get_chunk_free_flag(MemNode *node) 
+{
+	return (!(node->header & 0x00000001));
+}
+
+int get_chunk_size(MemNode *node)
+{
+	return (node->header & 0xFFFFFFE0);
+}
+
+double _pow(double b, int e)
+{
+	double result = 1;
+	for (int i = 0; i < e; i++)
+		result = result * b;
+
+	return result;
+}
+
+size_t alignment(size_t size)
+{
+	if ((size & 0x7) == 0)
+		return size;
+	return ((size >> 3) + 1) << 3;
+}
+
+
 
 /*
  * This function, defined in bulk.c, allocates a contiguous memory
@@ -73,8 +108,7 @@ extern void bulk_free(void *ptr, size_t size);
  * basically counts the number of leading binary zeroes in the value
  * passed as its argument.
  */
-static inline __attribute__((unused)) int block_index(size_t x)
-{
+static inline __attribute__((unused)) int block_index(size_t x) {
     if (x <= 8) {
         return 5;
     } else {
@@ -82,79 +116,105 @@ static inline __attribute__((unused)) int block_index(size_t x)
     }
 }
 
-static void free_block_node_data(DataNode *node, unsigned int size)
+static void create_node_data(MemNode *chunk, size_t size)
 {
-    DataNode **list = &memTable->chunckList[block_index(size - __OFFICE_SIZE) - 5];
-    if (*list != NULL)
-        (*list)->prev = node;
+	// alloc list
+	MemNode **list = &gMemDataTable->chunkList[block_index(size - sizeof(size_t)) - 5];
+	if (*list != NULL) {
+		(*list)->prev = chunk;
+	}
+	chunk->prev = NULL;
+	chunk->next = *list;
+	// create node
+	*list = chunk;
+	my_print("current index %d, mem size %lu, mem chunk: %p \n", block_index(size - sizeof(size_t)) - 5, size, chunk);
+}
 
-    node->prev = NULL;
-    node->next = *list;
-    *list = node;
+static void split_mm(void *bAddr, int alloc_size, int total_size)
+{
+	for (int size = 2048; size >= 32; size /= 2) 
+	{
+		while (total_size >= size) 
+		{
+			MemNode *node = bAddr + alloc_size;
+			node->header = size;
+			set_chunk_free_flag(node);
+			create_node_data(node, size);
+
+			total_size -= size;
+			alloc_size += size;
+		}
+	}
 }
 
 /*
  * You must implement malloc().  Your implementation of malloc() must be
  * the multi-pool allocator described in the project handout.
  */
+ 
 void *malloc(size_t size)
 {
-    unsigned int requestMemSize  = 0;
-    if (memTable == NULL) {
-        memTable = (MemList *)sbrk(__CHUNK_SIZE); // malloc 4096 byte data
-        if (memTable == NULL)
-            return NULL;
-        memset(memTable, 0, sizeof(MemList));
-    }
-    if (size <= 0)
-        return NULL;
-
-    requestMemSize = (size/8 + 1) * 8;
-    if (requestMemSize > (__CHUNK_SIZE - __OFFICE_SIZE)) {
-        
-        DataNode *chunk = bulk_alloc(requestMemSize + __OFFICE_SIZE);
-        chunk->header = requestMemSize + __OFFICE_SIZE;
-        __ALLOC(chunk);
-        return chunk->data;
-
-    } else if (requestMemSize <= (__CHUNK_SIZE - __OFFICE_SIZE)) {
-
-        for (int i = block_index(requestMemSize) - 5; i < __CHUNK_NUM; i++) {
-            DataNode **list = &memTable->chunckList[i];
-            if (*list != NULL) {
-                DataNode *node = *list;
-                *list = (*list)->next;
-                if (*list != NULL)
-                    (*list)->prev = NULL;
-                node->next = NULL;
-                __ALLOC(node);
-                return node->data;
-            }
-        }
-
-        DataNode *block = (DataNode *)sbrk(__CHUNK_SIZE);
-        if (block == NULL)
-            return NULL;
-        unsigned int allocSize = pow(2, block_index(requestMemSize));
-        block->header = allocSize;
-        __ALLOC(block);
-
-        int replaceSize = 0;
-        replaceSize = __CHUNK_SIZE - allocSize;
-        for (int size = 4096; size >= 32; size /= 2) {
-            while ( replaceSize >= size) {
-                DataNode *newBlock = block + allocSize;
-                newBlock->header = size;
-                __FREE(newBlock);
-
-                free_block_node_data(newBlock, size);
-                replaceSize -= size;
-                allocSize += size;
-            }
-        }
-        return block->data;
-    }
-    return NULL;
+	if (gMemDataTable == NULL) {
+		// create a piece of memory 
+		gMemDataTable = (MemList *)sbrk(CHUNK_SIZE);
+		if (gMemDataTable == NULL) {
+			return NULL;
+		}
+		// reset this memory
+		memset(gMemDataTable, 0, sizeof(MemList));
+	}
+	if (size <= 0) {
+		return NULL;
+	}
+	
+	// alignment  size of memroy
+	size_t get_size = alignment(size);
+	my_print("alignment size = %lu, get_size = %lu \n", size, get_size);
+	
+	if (get_size <= (CHUNK_SIZE - sizeof(size_t)))
+	{
+		int index = block_index(get_size) - 5;
+		// Traversing the list
+		for (int i = index; i < 8; i++)
+		{
+			MemNode **list = &gMemDataTable->chunkList[i];
+			if (*list != NULL) 
+			{
+				MemNode *ptr = *list;
+				*list = (*list)->next;
+				if (*list != NULL)
+				{
+					(*list)->prev = NULL;
+				}
+				// get useless block
+				ptr->next = NULL;
+				my_print("Get block in %d, block %p, return %p \n", i, ptr, ptr->data);
+				set_chunk_alloc_flag(ptr);
+				return ptr->data;
+			}
+		}
+		MemNode *block = (MemNode *)sbrk(CHUNK_SIZE);
+		if (block == NULL) {
+			return NULL;
+		}
+		// get alloc size
+		size_t alloc_size = _pow(2, block_index(get_size));
+		// put the size to the node header
+		block->header = alloc_size;
+		my_print("alloc size %lu, block %p, return %p \n", alloc_size, block, block->data);
+		
+		// setup this mem flag
+		set_chunk_alloc_flag(block);
+		split_mm(block, alloc_size, CHUNK_SIZE - alloc_size);
+		
+		return block->data;
+	} else {
+		MemNode *newptr = bulk_alloc(get_size + sizeof(size_t));
+		newptr->header = get_size + sizeof(size_t);
+		set_chunk_alloc_flag(newptr);
+		my_print("alloc mem size %lu, block addr %p, data %p", get_size + sizeof(size_t), newptr, newptr->data);
+		return newptr->data;
+	}
 }
 
 /*
@@ -170,12 +230,14 @@ void *malloc(size_t size)
  */
 void *calloc(size_t nmemb, size_t size)
 {
-    unsigned int resize = ((nmemb * size) / 8 + 1) * 8;
-    void *data = malloc(resize);
-    if (data != NULL)
-        memset(data, 0, resize);
+	
+	size_t get_size = alignment(nmemb * size);
+    void *ptr = malloc(get_size);
+	if (ptr != NULL)
+		memset(ptr, 0, get_size);
+	my_print("clear mem size %lu, return %p \n", get_size, ptr);
 
-    return data;
+    return ptr;
 }
 
 /*
@@ -192,50 +254,81 @@ void *calloc(size_t nmemb, size_t size)
  */
 void *realloc(void *ptr, size_t size)
 {
-    unsigned int resize = (size / 8 + 1) * 8;
-    if (ptr == NULL)
-        return malloc(resize);
-    else {
-        if (resize == 0) {
-            free(ptr);
-            return NULL;
-        } else {
-            DataNode *block = ptr - __OFFICE_SIZE;
-            unsigned int blockSize = (block->header & 0xFFFFFFE0);
-            if (resize == (blockSize - __OFFICE_SIZE))
-                return ptr;
-            if (blockSize <= __CHUNK_SIZE) {
-                if (block_index(resize) == block_index(blockSize - __OFFICE_SIZE))
-                    return ptr;
-                else {
-                    char data[__CHUNK_SIZE] = { 0 };
-                    memcpy(data, ptr, blockSize - __OFFICE_SIZE);
-                    free(ptr);
-                    void *rePtr = malloc(resize);
-                    DataNode *reBlock = rePtr - __OFFICE_SIZE;
-                    unsigned int newSize = reBlock->header & 0xFFFFFFE0;
-                    if (newSize < blockSize)
-                        memcpy(rePtr, data, newSize - __OFFICE_SIZE);
-                    else
-                        memcpy(rePtr, data, blockSize - __OFFICE_SIZE);
-                    return rePtr;
-                }
-
-            } else if (blockSize > __CHUNK_SIZE) {
-                void *rePtr = malloc(resize);
-                DataNode *reBlock = rePtr - __OFFICE_SIZE;
-                unsigned int newSize = reBlock->header & 0xFFFFFFE0;
-                if (newSize < blockSize)
-                    memcpy(rePtr, ptr, newSize - __OFFICE_SIZE);
-                else
-                    memcpy(rePtr, ptr, blockSize - __OFFICE_SIZE);
-
-                free(ptr);
-                return rePtr;
-            }
-        }
-    }
-    return NULL;
+	size_t get_size = alignment(size);
+	if (ptr == NULL) 
+	{
+		return malloc(get_size);
+	} 
+	else
+	{
+		if (get_size == 0) 
+		{
+			free(ptr);
+			return NULL;
+		}
+		else 
+		{
+			MemNode *block = ptr - sizeof(size_t);
+			size_t block_size = get_chunk_size(block);
+			my_print(" realloc mem size %lu, get_size %lu, block_size %lu \n", size, get_size, block_size);
+			if (get_size == (block_size - sizeof(size_t))) 
+			{				
+				// get the same size,return ptr
+				return ptr;
+			}
+			
+			if (CHUNK_SIZE >= block_size)
+			{
+				if (block_index(get_size) == block_index(block_size - sizeof(size_t))) 
+				{
+					my_print("get the same power and will return %p \n", ptr);
+					return ptr;
+				} 
+				else 
+				{
+					
+					char mem_data[CHUNK_SIZE] = {0};
+					// backup this mem data
+					memcpy(mem_data, ptr, block_size - sizeof(size_t));
+					// free this ptr
+					free(ptr);
+					
+					void *newPtr = malloc(get_size);
+					MemNode *newBlock = newPtr - sizeof(size_t);
+					size_t newBlockSize = get_chunk_size(newBlock);
+					// new block size and put backup data to the mem
+					if (newBlockSize < block_size) 
+					{
+						memcpy(newPtr, mem_data, newBlockSize - sizeof(size_t));
+					} 
+					else 
+					{
+						memcpy(newPtr, mem_data, block_size - sizeof(size_t));
+					}
+					return newPtr;
+				}
+			}
+			else 
+			{
+				// backup this mem data
+				void *newPtr = malloc(get_size);
+				MemNode *newBlock = newPtr - sizeof(size_t);
+				size_t newBlockSize = get_chunk_size(newBlock);
+				//new block size and put backup data to the mem
+				if (newBlockSize < block_size) 
+				{
+					memcpy(newPtr, ptr, newBlockSize - sizeof(size_t));
+				} 
+				else 
+				{
+					memcpy(newPtr, ptr, block_size - sizeof(size_t));
+				}
+				// free this ptr
+				free(ptr);
+				return newPtr;
+			}
+		}
+	}
 }
 
 /*
@@ -247,15 +340,23 @@ void *realloc(void *ptr, size_t size)
  */
 void free(void *ptr)
 {
-    DataNode *block = ptr - __OFFICE_SIZE;
-    if (__CHECK_FREE(block))
-        return;
-    __FREE(block);
+	if (ptr == NULL) {
+		return;
+	}
 
-    if (block->header <= __CHUNK_SIZE)
-        free_block_node_data(block, block->header);
-    else
-        bulk_free(block, block->header);
+	MemNode *block = ptr - sizeof(size_t);
+	if (get_chunk_free_flag(block))
+		return;
+	
+	
+	set_chunk_free_flag(block);
+	if (block->header <= CHUNK_SIZE) {
+		my_print("free mem: %p and size %lu \n", ptr, block->header);
+		create_node_data(block, block->header);
+	} else {
+		my_print("free mem: %p and size %lu \n", ptr, block->header);
+		bulk_free(block, block->header);
+	}
+	
     return;
 }
-
